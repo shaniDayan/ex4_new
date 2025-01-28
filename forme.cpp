@@ -1,97 +1,124 @@
-#include <unistd.h>     // sbrk
-#include <sys/mman.h>   // mmap, munmap
-#include <cstring>      // memset, memmove
-#include <iostream>     // std::cerr, std::cout
-#include <cmath>        // pow
+#include <unistd.h>
+#include <sys/mman.h>
+#include <cstring>
+#include <iostream>
+#include <cmath>
 
-static const int    MAX_ORDER      = 10;          // Buddy max order (0..10)
-static const size_t BLOCK_SIZE     = 128 * 1024;  // 128KB
-static const int    NUM_INIT_BLOCKS= 32;          // total 32 blocks => 4MB
+#define MAX_ORDER 10
+static const size_t BLOCK_SIZE = 128 * 1024; // 128KB
+static const int    NUM_INIT_BLOCKS = 32;    // 32 blocks => 4MB total
 static bool         is_buddy_initialized = false;
 
-// We store a pointer to the start of the entire 4MB buddy region
-static char* BASE = nullptr;
-
-// A cookie if you need a canary or ID
 static int GlobalCookie = 0x12345678;
+static char* BASE = nullptr; // base of the 4MB region
 
-// ------------------------------------
-// MallocMetadata
-// ------------------------------------
+/**************************************************************
+ * MallocMetadata
+ **************************************************************/
 struct MallocMetadata {
     int    cookie;
-    size_t size;      // "usable" size of the block (excluding this metadata)
-    bool   is_free;   // true if block is free
-    bool   is_mmap;   // true if allocated by mmap
-    int    order;     // buddy order (if is_mmap=false), -1 otherwise
+    size_t size;      // usable size (excluding metadata)
+    bool   is_free;   // is this block free
+    bool   is_mmap;   // is this allocated by mmap
+    int    order;     // buddy order (if !is_mmap), else -1
 
     MallocMetadata* next;
     MallocMetadata* prev;
 };
 
-// ------------------------------------
-// BlocksList: a minimal doubly-linked list
-//             (NO STATS updates here)
-// ------------------------------------
+/**************************************************************
+ * A simple doubly-linked list (by address)
+ **************************************************************/
 class BlocksList {
 public:
     MallocMetadata* head;
 
-    BlocksList() {
+    // Stats for demonstration (like code B)
+    size_t num_free_blocks;
+    size_t num_free_bytes;
+    size_t num_allocated_blocks;
+    size_t num_allocated_bytes;
+    size_t num_meta_data_bytes;
+
+    BlocksList()
+    {
         head = nullptr;
+        num_free_blocks       = 0;
+        num_free_bytes        = 0;
+        num_allocated_blocks  = 0;
+        num_allocated_bytes   = 0;
+        num_meta_data_bytes   = 0;
     }
 
-    // Add a block by address
-    void addBlock(MallocMetadata* block) {
-        if (!block) return;
-        if (!head) {
-            head = block;
-            block->prev = nullptr;
-            block->next = nullptr;
+    void AddBlock(MallocMetadata* b)
+    {
+        if(!b) return;
+        // update stats
+        num_allocated_blocks++;
+        num_allocated_bytes += b->size;
+        num_meta_data_bytes += sizeof(MallocMetadata);
+        if(b->is_free) {
+            num_free_blocks++;
+            num_free_bytes += b->size;
+        }
+        // insert sorted by address
+        if(!head) {
+            head = b;
+            b->next = nullptr;
+            b->prev = nullptr;
             return;
         }
-        if (block < head) {
-            block->next = head;
-            block->prev = nullptr;
-            head->prev = block;
-            head = block;
+        if(b < head) {
+            b->next = head;
+            b->prev = nullptr;
+            head->prev = b;
+            head = b;
             return;
         }
-        // Otherwise, find correct position
+        // otherwise
         MallocMetadata* curr = head;
-        while (curr->next && (curr->next < block)) {
+        while(curr->next && (curr->next < b)) {
             curr = curr->next;
         }
-        block->next = curr->next;
-        block->prev = curr;
-        if (curr->next) {
-            curr->next->prev = block;
+        b->next = curr->next;
+        b->prev = curr;
+        if(curr->next) {
+            curr->next->prev = b;
         }
-        curr->next = block;
+        curr->next = b;
     }
 
-    // Remove a block from the list
-    void removeBlock(MallocMetadata* block) {
-        if (!block) return;
-        if (block->prev) {
-            block->prev->next = block->next;
+    void RemoveBlock(MallocMetadata* b)
+    {
+        if(!b) return;
+        // update stats
+        num_allocated_blocks--;
+        num_allocated_bytes -= b->size;
+        num_meta_data_bytes -= sizeof(MallocMetadata);
+        if(b->is_free) {
+            num_free_blocks--;
+            num_free_bytes -= b->size;
+        }
+        // remove from list
+        if(b->prev) {
+            b->prev->next = b->next;
         } else {
-            if (head == block) {
-                head = block->next;
+            if(head == b) {
+                head = b->next;
             }
         }
-        if (block->next) {
-            block->next->prev = block->prev;
+        if(b->next) {
+            b->next->prev = b->prev;
         }
-        block->next = nullptr;
-        block->prev = nullptr;
+        b->next = nullptr;
+        b->prev = nullptr;
     }
 
-    // Find first free block with size >= neededSize
-    MallocMetadata* findFirstFreeBlock(size_t neededSize) {
+    MallocMetadata* FindFirstFreeBlock(size_t needed)
+    {
         MallocMetadata* curr = head;
-        while (curr) {
-            if (curr->is_free && curr->size >= neededSize) {
+        while(curr) {
+            if(curr->is_free && curr->size >= needed) {
                 return curr;
             }
             curr = curr->next;
@@ -100,504 +127,496 @@ public:
     }
 };
 
-// ------------------------------------
-// We keep stats for each order in a separate struct
-// plus one for mmap
-// ------------------------------------
-struct BuddyStats {
-    size_t num_free_blocks;
-    size_t num_free_bytes;
-    size_t num_allocated_blocks;
-    size_t num_allocated_bytes;
-    size_t num_meta_data_bytes;
-};
-
-static BuddyStats buddyStats[MAX_ORDER + 1]; // one for each order
-static BuddyStats mmapStats;                 // separate stats for mmap
-
-// For convenience, we define a function to get the
-// total across all buddyStats + mmapStats:
-static size_t sumFreeBlocks() {
-    size_t total = 0;
-    for (int i = 0; i <= MAX_ORDER; i++)
-        total += buddyStats[i].num_free_blocks;
-    total += mmapStats.num_free_blocks;
-    return total;
-}
-
-static size_t sumFreeBytes() {
-    size_t total = 0;
-    for (int i = 0; i <= MAX_ORDER; i++)
-        total += buddyStats[i].num_free_bytes;
-    total += mmapStats.num_free_bytes;
-    return total;
-}
-
-static size_t sumAllocatedBlocks() {
-    size_t total = 0;
-    for (int i = 0; i <= MAX_ORDER; i++)
-        total += buddyStats[i].num_allocated_blocks;
-    total += mmapStats.num_allocated_blocks;
-    return total;
-}
-
-static size_t sumAllocatedBytes() {
-    size_t total = 0;
-    for (int i = 0; i <= MAX_ORDER; i++)
-        total += buddyStats[i].num_allocated_bytes;
-    total += mmapStats.num_allocated_bytes;
-    return total;
-}
-
-static size_t sumMetaDataBytes() {
-    size_t total = 0;
-    for (int i = 0; i <= MAX_ORDER; i++)
-        total += buddyStats[i].num_meta_data_bytes;
-    total += mmapStats.num_meta_data_bytes;
-    return total;
-}
-
-// We'll keep an array of buddy lists for [0..MAX_ORDER]
+/**************************************************************
+ * We maintain an array for buddy orders [0..MAX_ORDER],
+ * plus one list for mmap-allocated blocks
+ **************************************************************/
 static BlocksList buddyArray[MAX_ORDER + 1];
-// We'll keep a separate list for mmap blocks
 static BlocksList mmapList;
 
-// ------------------------------------
-// Helper to update stats when we add a block
-// to a specific order or to mmapStats
-// ------------------------------------
-static void incrementStats(int order, MallocMetadata* block) {
-    if (!block) return;
-    size_t blockSize = block->size;
-    // If it's an mmap block
-    if (order < 0) {
-        mmapStats.num_allocated_blocks++;
-        mmapStats.num_allocated_bytes += blockSize;
-        mmapStats.num_meta_data_bytes += sizeof(MallocMetadata);
-        if (block->is_free) {
-            mmapStats.num_free_blocks++;
-            mmapStats.num_free_bytes += blockSize;
-        }
-    } else {
-        buddyStats[order].num_allocated_blocks++;
-        buddyStats[order].num_allocated_bytes += blockSize;
-        buddyStats[order].num_meta_data_bytes += sizeof(MallocMetadata);
-        if (block->is_free) {
-            buddyStats[order].num_free_blocks++;
-            buddyStats[order].num_free_bytes += blockSize;
-        }
-    }
-}
-
-// ------------------------------------
-// Helper to update stats when we remove a block
-// from a specific order or from mmapStats
-// ------------------------------------
-static void decrementStats(int order, MallocMetadata* block) {
-    if (!block) return;
-    size_t blockSize = block->size;
-
-    if (order < 0) {
-        mmapStats.num_allocated_blocks--;
-        mmapStats.num_allocated_bytes -= blockSize;
-        mmapStats.num_meta_data_bytes -= sizeof(MallocMetadata);
-        if (block->is_free) {
-            mmapStats.num_free_blocks--;
-            mmapStats.num_free_bytes -= blockSize;
-        }
-    } else {
-        buddyStats[order].num_allocated_blocks--;
-        buddyStats[order].num_allocated_bytes -= blockSize;
-        buddyStats[order].num_meta_data_bytes -= sizeof(MallocMetadata);
-        if (block->is_free) {
-            buddyStats[order].num_free_blocks--;
-            buddyStats[order].num_free_bytes -= blockSize;
-        }
-    }
-}
-
-// ------------------------------------
-// Some forward declarations
-// ------------------------------------
+/**************************************************************
+ * Forward declarations
+ **************************************************************/
 static bool initialize_buddy_allocator();
-static MallocMetadata* allocate_with_mmap(size_t userSize);
-static void free_mmap_block(MallocMetadata* block);
-static MallocMetadata* getBuddy(MallocMetadata* block);
-static MallocMetadata* split_block(MallocMetadata* block);
-static MallocMetadata* merge_blocks(MallocMetadata* b1, MallocMetadata* b2);
+static MallocMetadata* CutInHalf(size_t sizeNeeded);
+static void MergeBuddies(MallocMetadata* blockToFree, int mergeTillOrder);
+static int  CheckIfMergePossible(MallocMetadata* oldBlock, size_t newSize);
 
-// ------------------------------------
-// mmap-related helpers
-// ------------------------------------
-static MallocMetadata* allocate_with_mmap(size_t userSize)
-{
-    size_t totalSize = userSize + sizeof(MallocMetadata);
-    void* addr = mmap(nullptr, totalSize,
-                      PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (addr == MAP_FAILED) {
-        return nullptr;
-    }
-
-    MallocMetadata* block = (MallocMetadata*)addr;
-    block->cookie  = GlobalCookie;
-    block->size    = userSize;
-    block->is_free = false;
-    block->is_mmap = true;
-    block->order   = -1;
-    block->next    = nullptr;
-    block->prev    = nullptr;
-
-    // Insert into the mmapList
-    mmapList.addBlock(block);
-    // Now update stats for "order = -1"
-    incrementStats(-1, block);
-
-    return block;
-}
-
-static void free_mmap_block(MallocMetadata* block)
-{
-    if (!block) return;
-    // first, we remove from the list
-    mmapList.removeBlock(block);
-    // then, update stats
-    decrementStats(-1, block);
-
-    // now unmap the memory
-    munmap(block, block->size + sizeof(MallocMetadata));
-}
-
-// ------------------------------------
-// initialize_buddy_allocator()
-// ------------------------------------
+//*************************************************************
+// Initialize
+//*************************************************************
 static bool initialize_buddy_allocator()
 {
-    if (is_buddy_initialized) return true;
+    if(is_buddy_initialized) return true;
     is_buddy_initialized = true;
 
-    // 1) Alignment
-    void* currBrk   = sbrk(0);
-    size_t alignment = ((uintptr_t)currBrk) % (NUM_INIT_BLOCKS * BLOCK_SIZE);
-    if (alignment != 0) {
-        size_t toAdd = (NUM_INIT_BLOCKS * BLOCK_SIZE) - alignment;
-        void* res = sbrk(toAdd);
-        if (res == (void*)-1) {
-            std::cerr << "Failed alignment sbrk\n";
+    // alignment
+    void* currBrk = sbrk(0);
+    size_t alignment = (uintptr_t)currBrk % (NUM_INIT_BLOCKS * BLOCK_SIZE);
+    if(alignment != 0) {
+        size_t toAdd = (NUM_INIT_BLOCKS*BLOCK_SIZE) - alignment;
+        void* ret = sbrk(toAdd);
+        if(ret == (void*)-1) {
             return false;
         }
     }
 
-    // 2) Allocate the 4MB (32 * 128KB)
+    // allocate 4MB
     BASE = (char*)sbrk(NUM_INIT_BLOCKS * BLOCK_SIZE);
-    if (BASE == (void*)-1) {
-        std::cerr << "Failed sbrk for buddy blocks\n";
+    if(BASE == (void*)-1) {
         return false;
     }
 
-    // 3) We will store 32 separate blocks (each 128KB) in buddyArray[MAX_ORDER].
-    //    Each block is free initially.
+    // we create a single chain of 32 blocks in the highest order (order=MAX_ORDER)
+    // each of size 128KB
     char* runner = BASE;
-    for (int i = 0; i < NUM_INIT_BLOCKS; i++) {
+    for(int i=0; i<NUM_INIT_BLOCKS; i++) {
         MallocMetadata* block = (MallocMetadata*)runner;
         block->cookie  = GlobalCookie;
-        block->size    = BLOCK_SIZE; // 128KB
+        block->size    = BLOCK_SIZE;
         block->is_free = true;
         block->is_mmap = false;
-        block->order   = MAX_ORDER;  // 10
+        block->order   = MAX_ORDER;
         block->next    = nullptr;
         block->prev    = nullptr;
 
-        buddyArray[MAX_ORDER].addBlock(block);
-        // Update stats for the highest order = 10
-        incrementStats(MAX_ORDER, block);
-
+        buddyArray[MAX_ORDER].AddBlock(block);
         runner += BLOCK_SIZE;
     }
-
     return true;
 }
 
-// ------------------------------------
-// getBuddy: compute the buddy
-// ------------------------------------
-static MallocMetadata* getBuddy(MallocMetadata* block)
+/**************************************************************
+ * get order for a certain size
+ **************************************************************/
+static int GetBlockOrder(size_t size)
 {
-    if (!block || block->is_mmap) return nullptr;
-    if (block->order < 0 || block->order > MAX_ORDER) return nullptr;
-
-    uintptr_t blockAddr = (uintptr_t)block;
-    uintptr_t baseAddr  = (uintptr_t)BASE;
-    size_t    size      = block->size;
-
-    long diff = blockAddr - baseAddr;
-    // buddy is at +size or -size depending on remainder
-    long res = diff % (2 * size);
-    if (res == 0) {
-        // buddy is to the right
-        return (MallocMetadata*)(blockAddr + size);
-    } else {
-        // buddy is to the left
-        return (MallocMetadata*)(blockAddr - size);
+    // same approach as code B
+    // find i s.t. 128 * 2^i >= size
+    int order = 0;
+    size_t current = 128;
+    while(order <= MAX_ORDER) {
+        if(current >= size) break;
+        current <<= 1; // multiply by 2
+        order++;
     }
+    if(order>MAX_ORDER) return -1;
+    return order;
 }
 
-// ------------------------------------
-// split_block: splits one block into two
-// ------------------------------------
-static MallocMetadata* split_block(MallocMetadata* block)
+/**************************************************************
+ * Mmap Alloc/Free
+ **************************************************************/
+static MallocMetadata* allocate_with_mmap(size_t userSize)
 {
-    if (!block) return nullptr;
-    size_t half = block->size / 2;
-    int oldOrder = block->order;
-
-    // We'll remove the original block from the list first
-    // so we can re-add it with the updated size
-    buddyArray[oldOrder].removeBlock(block);
-    decrementStats(oldOrder, block);
-
-    // update the original block
-    block->size  = half;
-    block->order = oldOrder - 1;
-
-    // re-insert it into the lower order list
-    buddyArray[block->order].addBlock(block);
-    incrementStats(block->order, block);
-
-    // create the buddy
-    MallocMetadata* buddy = (MallocMetadata*)((char*)block + half);
-    buddy->cookie  = GlobalCookie;
-    buddy->size    = half;
-    buddy->is_free = true;
-    buddy->is_mmap = false;
-    buddy->order   = oldOrder - 1;
-    buddy->next    = nullptr;
-    buddy->prev    = nullptr;
-
-    // add buddy to buddyArray[buddy->order]
-    buddyArray[buddy->order].addBlock(buddy);
-    incrementStats(buddy->order, buddy);
-
-    return block; // Return the "first half"
-}
-
-// ------------------------------------
-// merge_blocks: merges two buddies
-// ------------------------------------
-static MallocMetadata* merge_blocks(MallocMetadata* b1, MallocMetadata* b2)
-{
-    // ensure b1 < b2
-    if (b2 < b1) {
-        MallocMetadata* tmp = b1;
-        b1 = b2;
-        b2 = tmp;
-    }
-    // remove both from their list + stats
-    buddyArray[b2->order].removeBlock(b2);
-    decrementStats(b2->order, b2);
-
-    buddyArray[b1->order].removeBlock(b1);
-    decrementStats(b1->order, b1);
-
-    // double b1
-    b1->size *= 2;
-    b1->order++;
-
-    // re-add the merged bigger block
-    buddyArray[b1->order].addBlock(b1);
-    incrementStats(b1->order, b1);
-
-    return b1;
-}
-
-// ------------------------------------
-// smalloc
-// ------------------------------------
-void* smalloc(size_t size)
-{
-    if (size == 0 || size > 100000000) {
+    size_t totalSize = userSize + sizeof(MallocMetadata);
+    void* addr = mmap(nullptr, totalSize, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+    if(addr == MAP_FAILED) {
         return nullptr;
     }
-    if (!is_buddy_initialized) {
-        if (!initialize_buddy_allocator()) {
-            return nullptr;
+    MallocMetadata* meta = (MallocMetadata*)addr;
+    meta->cookie  = GlobalCookie;
+    meta->size    = userSize;
+    meta->is_free = false;
+    meta->is_mmap = true;
+    meta->order   = -1;
+    meta->next    = nullptr;
+    meta->prev    = nullptr;
+
+    mmapList.AddBlock(meta);
+    return meta;
+}
+
+static void free_mmap_block(MallocMetadata* block)
+{
+    if(!block) return;
+    mmapList.RemoveBlock(block);
+    munmap(block, block->size + sizeof(MallocMetadata));
+}
+
+/**************************************************************
+ * "CutInHalf" - Splitting logic like code B
+ *
+ *  This function tries to find a free block in an order >=
+ *  the needed size. Then it repeatedly splits until we get
+ *  exactly the needed order, updating stats as in code B.
+ *
+ *  Return: a pointer to the block that exactly fits
+ **************************************************************/
+static MallocMetadata* CutInHalf(size_t sizeNeeded)
+{
+    int desiredOrder = GetBlockOrder(sizeNeeded);
+    if(desiredOrder < 0) return nullptr;
+
+    // find a free block from [desiredOrder..MAX_ORDER]
+    MallocMetadata* found = nullptr;
+    int foundOrder = -1;
+    for(int i=desiredOrder; i<=MAX_ORDER; i++){
+        found = buddyArray[i].FindFirstFreeBlock(sizeNeeded);
+        if(found) {
+            foundOrder = i;
+            break;
         }
     }
+    if(!found) return nullptr; // no block big enough
 
-    // If requested size + metadata > 128KB => use mmap
-    if (size + sizeof(MallocMetadata) > BLOCK_SIZE) {
-        MallocMetadata* block = allocate_with_mmap(size);
-        if (!block) return nullptr;
-        return (char*)block + sizeof(MallocMetadata);
+    // If foundOrder == desiredOrder, just return it
+    // but code B logic does "if we found a bigger block, we do multiple splits"
+    for(int j=foundOrder; j>desiredOrder; j--){
+        // Remove from order j
+        buddyArray[j].RemoveBlock(found);
+        // Update stats exactly as code B does
+        buddyArray[j].num_free_blocks--;
+        buddyArray[j].num_free_bytes -= found->size;
+        buddyArray[j].num_meta_data_bytes -= sizeof(MallocMetadata);
+        buddyArray[j].num_allocated_blocks--;
+        buddyArray[j].num_allocated_bytes -= found->size;
+
+        // Now we split into two halves
+        size_t half = found->size / 2;
+        MallocMetadata* secondhalf = (MallocMetadata*)((char*)found + half);
+
+        // The "first" half
+        found->size = half;
+        found->is_free = true;
+
+        // The "second" half
+        secondhalf->cookie  = GlobalCookie;
+        secondhalf->size    = half;
+        secondhalf->is_free = true;
+        secondhalf->next    = nullptr;
+        secondhalf->prev    = nullptr;
+
+        // Now we add both halves to order (j-1),
+        // updating stats the way code B does
+        buddyArray[j-1].AddBlock(found);
+        buddyArray[j-1].AddBlock(secondhalf);
+
+        buddyArray[j-1].num_free_bytes += 2*half;
+        buddyArray[j-1].num_free_bytes -= sizeof(MallocMetadata);
+        buddyArray[j-1].num_free_blocks += 2;
+        buddyArray[j-1].num_meta_data_bytes += 2*sizeof(MallocMetadata);
+        buddyArray[j-1].num_allocated_blocks += 2;
+        buddyArray[j-1].num_allocated_bytes += 2*half;
+        buddyArray[j-1].num_allocated_bytes -= sizeof(MallocMetadata);
+
+        // set found to the "first" half (arbitrary),
+        // so next iteration will keep splitting the same piece if needed
+        found = found;
+    }
+    // Now found is in the order = desiredOrder
+    // Return it
+    return found;
+}
+
+/**************************************************************
+ * MergeBuddies - repeated merges, as code B does
+ *   We remove blocks from the lower order and reinsert
+ *   them at the higher order, updating stats each time.
+ **************************************************************/
+static MallocMetadata* FindBuddy(MallocMetadata* block, size_t blockSize)
+{
+    // code B does something like:
+    if(!block) return nullptr;
+    long diff = (long)block - (long)BASE;
+    long res  = diff % (2*blockSize);
+    if(block == (MallocMetadata*)BASE) {
+        // buddy is to the right
+        return (MallocMetadata*)((char*)block + blockSize);
+    }
+    else if(block == (MallocMetadata*)((char*)BASE + 32*BLOCK_SIZE - blockSize)) {
+        // buddy is to the left
+        return (MallocMetadata*)((char*)block - blockSize);
+    }
+    else {
+        if(res == 0) {
+            return (MallocMetadata*)((char*)block + blockSize);
+        } else {
+            return (MallocMetadata*)((char*)block - blockSize);
+        }
+    }
+}
+
+static void MergeBuddies(MallocMetadata* blockToFree, int mergeTillOrder)
+{
+    // code B merges up to a certain order (or all the way up)
+    if(!blockToFree) return;
+    if(blockToFree->cookie != GlobalCookie) return;
+
+    int currentOrder = GetBlockOrder(blockToFree->size);
+    if(mergeTillOrder == -1) {
+        mergeTillOrder = MAX_ORDER;
+    }
+
+    for(int j=currentOrder; j<mergeTillOrder; j++){
+        MallocMetadata* buddy = FindBuddy(blockToFree, blockToFree->size);
+        if(!buddy) return;
+        if(buddy->is_free){
+            // remove both from the list j
+            buddyArray[j].RemoveBlock(blockToFree);
+            buddyArray[j].RemoveBlock(buddy);
+
+            buddyArray[j].num_free_blocks -= 2;
+            buddyArray[j].num_free_bytes  -= (blockToFree->size)*2;
+            buddyArray[j].num_meta_data_bytes -= 2*sizeof(MallocMetadata);
+            buddyArray[j].num_allocated_blocks -= 2;
+            buddyArray[j].num_allocated_bytes  -= (blockToFree->size)*2;
+
+            // whichever is lower address, we keep it
+            if(buddy < blockToFree) {
+                buddyArray[j+1].AddBlock(buddy);
+                buddy->size *= 2;
+                buddyArray[j+1].num_free_bytes += buddy->size;
+                buddyArray[j+1].num_free_bytes += sizeof(MallocMetadata);
+                buddyArray[j+1].num_free_blocks++;
+                buddyArray[j+1].num_meta_data_bytes += sizeof(MallocMetadata);
+                buddyArray[j+1].num_allocated_blocks++;
+                buddyArray[j+1].num_allocated_bytes += buddy->size;
+                buddyArray[j+1].num_allocated_bytes += sizeof(MallocMetadata);
+
+                blockToFree = buddy; // merged block
+            }
+            else {
+                buddyArray[j+1].AddBlock(blockToFree);
+                blockToFree->size *= 2;
+                buddyArray[j+1].num_free_bytes += blockToFree->size;
+                buddyArray[j+1].num_free_bytes += sizeof(MallocMetadata);
+                buddyArray[j+1].num_free_blocks++;
+                buddyArray[j+1].num_meta_data_bytes += sizeof(MallocMetadata);
+                buddyArray[j+1].num_allocated_blocks++;
+                buddyArray[j+1].num_allocated_bytes += blockToFree->size;
+                buddyArray[j+1].num_allocated_bytes += sizeof(MallocMetadata);
+            }
+        } else {
+            return; // buddy not free
+        }
+    }
+}
+
+/**************************************************************
+ * CheckIfMergePossible
+ **************************************************************/
+static int CheckIfMergePossible(MallocMetadata* oldBlock, size_t newSize)
+{
+    if(!oldBlock) return -1;
+    if(oldBlock->cookie != GlobalCookie) return -1;
+
+    int startOrder = GetBlockOrder(oldBlock->size);
+    if(startOrder < 0) return -1;
+
+    size_t currentSize = oldBlock->size;
+    MallocMetadata* curr = oldBlock;
+    for(int j=startOrder; j<MAX_ORDER; j++){
+        if(currentSize >= newSize) return j;
+        MallocMetadata* buddy = FindBuddy(curr, currentSize);
+        if(buddy && buddy->is_free) {
+            // merging feasible
+            // next size is *2
+            currentSize *= 2;
+            // keep whichever is lower address as 'curr'
+            if(buddy < oldBlock) {
+                curr = buddy;
+            } else {
+                curr = oldBlock;
+            }
+        } else {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+/**************************************************************
+ * smalloc
+ **************************************************************/
+void* smalloc(size_t size)
+{
+    if(!is_buddy_initialized) {
+        if(!initialize_buddy_allocator()) return nullptr;
+    }
+    if(size == 0 || size > 100000000) {
+        return nullptr;
+    }
+
+    // if bigger than 128KB => mmap
+    if(size + sizeof(MallocMetadata) > BLOCK_SIZE) {
+        MallocMetadata* meta = allocate_with_mmap(size);
+        if(!meta) return nullptr;
+        return (char*)meta + sizeof(MallocMetadata);
     }
 
     size_t needed = size + sizeof(MallocMetadata);
-
-    // find the order
-    int order = 0;
-    size_t currentSize = 128; // base chunk = 128
-    while (order <= MAX_ORDER) {
-        if (currentSize >= needed) {
-            break;
-        }
-        currentSize <<= 1;
-        order++;
+    // code B approach: call "CutInHalf" to get a block
+    MallocMetadata* freeBlock = CutInHalf(needed);
+    if(!freeBlock) {
+        return nullptr; // no block available
     }
-    if (order > MAX_ORDER) {
-        // can't handle
-        return nullptr;
-    }
+    // now freeBlock is the correct size/order
+    // Mark it as used => reduce free blocks etc.
+    freeBlock->is_free = false;
 
-    // search from [order .. MAX_ORDER]
-    for (int i = order; i <= MAX_ORDER; i++) {
-        MallocMetadata* candidate = buddyArray[i].findFirstFreeBlock(needed);
-        if (candidate) {
-            // We'll remove from buddyArray[i] + stats
-            buddyArray[i].removeBlock(candidate);
-            decrementStats(i, candidate);
+    // final correction (like code B does):
+    int i = GetBlockOrder(freeBlock->size);
+    buddyArray[i].num_free_blocks--;
+    buddyArray[i].num_free_bytes -= freeBlock->size;
+    // In code B, sometimes we add back `sizeof(MallocMetadata)` if we want
+    // to do "num_free_bytes += sizeof(MallocMetadata);" – depends on your exact logic
 
-            candidate->is_free = false;
-
-            // if the block is bigger than needed, keep splitting
-            while (candidate->order > order) {
-                candidate = split_block(candidate);
-                // The split_block function handles stats updates itself
-            }
-            return (char*)candidate + sizeof(MallocMetadata);
-        }
-    }
-
-    // none found
-    return nullptr;
+    return (char*)freeBlock + sizeof(MallocMetadata);
 }
 
-// ------------------------------------
-// scalloc
-// ------------------------------------
+/**************************************************************
+ * scalloc
+ **************************************************************/
 void* scalloc(size_t num, size_t size)
 {
-    if (num == 0 || size == 0) return nullptr;
-    size_t totalSize = num * size;
-    if (size != 0 && (totalSize / size) != num) {
+    if(num == 0 || size == 0) return nullptr;
+    size_t totalSize = num*size;
+    if(size != 0 && (totalSize / size) != num) {
         // overflow
         return nullptr;
     }
     void* p = smalloc(totalSize);
-    if (!p) return nullptr;
+    if(!p) return nullptr;
     memset(p, 0, totalSize);
     return p;
 }
 
-// ------------------------------------
-// sfree
-// ------------------------------------
+/**************************************************************
+ * sfree
+ **************************************************************/
 void sfree(void* p)
 {
-    if (!p) return;
-    MallocMetadata* block = (MallocMetadata*)((char*)p - sizeof(MallocMetadata));
-    if (block->cookie != GlobalCookie) {
+    if(!p) return;
+    MallocMetadata* meta = (MallocMetadata*)((char*)p - sizeof(MallocMetadata));
+    if(meta->cookie != GlobalCookie) {
         // canary check
         return;
     }
-    if (block->is_free) {
+    if(meta->is_free) {
+        return;
+    }
+    if(meta->is_mmap) {
+        // free via mmap
+        meta->is_free = true;
+        free_mmap_block(meta);
         return;
     }
 
-    // if it's mmap
-    if (block->is_mmap) {
-        block->is_free = true;
-        free_mmap_block(block);
-        return;
-    }
+    // buddy block
+    meta->is_free = true;
+    int i = GetBlockOrder(meta->size);
+    // code B style: add to array i
+    buddyArray[i].AddBlock(meta);
+    buddyArray[i].num_free_blocks++;
+    buddyArray[i].num_free_bytes += meta->size;
+    buddyArray[i].num_free_bytes -= sizeof(MallocMetadata);
 
-    // else buddy
-    block->is_free = true;
-    // add back to buddy
-    buddyArray[block->order].addBlock(block);
-    incrementStats(block->order, block);
-
-    // attempt merges repeatedly
-    while (block->order < MAX_ORDER) {
-        MallocMetadata* buddy = getBuddy(block);
-        if (!buddy) break;
-        // Check if buddy is free, same order, not mmap
-        if (buddy->is_free && !buddy->is_mmap && buddy->order == block->order) {
-            // remove block before merging
-            buddyArray[block->order].removeBlock(block);
-            decrementStats(block->order, block);
-            // now merge them
-            block = merge_blocks(block, buddy);
-        } else {
-            break;
-        }
-    }
+    // attempt merges
+    MergeBuddies(meta, -1);
 }
 
-// ------------------------------------
-// srealloc
-// ------------------------------------
+/**************************************************************
+ * srealloc
+ **************************************************************/
 void* srealloc(void* oldp, size_t newSize)
 {
-    if (newSize == 0) {
+    if(newSize == 0) {
         sfree(oldp);
         return nullptr;
     }
-    if (!oldp) {
+    if(!oldp) {
         return smalloc(newSize);
     }
-
     MallocMetadata* oldBlock = (MallocMetadata*)((char*)oldp - sizeof(MallocMetadata));
-    if (oldBlock->cookie != GlobalCookie) {
+    if(oldBlock->cookie != GlobalCookie)
         return nullptr;
-    }
 
-    size_t oldUserSize = oldBlock->size;
-    if (oldUserSize >= newSize) {
+    if(oldBlock->size >= newSize) {
         // already big enough
         return oldp;
     }
 
-    // if it's mmap or not enough space => new, copy, free old
-    bool wasMmap = oldBlock->is_mmap;
-    void* newp = smalloc(newSize);
-    if (!newp) return nullptr;
+    // code B approach:
+    // 1) if oldBlock is big enough => done
+    // 2) else, check if we can merge to get enough space
+    if(!oldBlock->is_mmap) {
+        // buddy approach
+        int mergeOrder = CheckIfMergePossible(oldBlock, newSize + sizeof(MallocMetadata));
+        if(mergeOrder != -1) {
+            // we do merges
+            MergeBuddies(oldBlock, mergeOrder);
+            // fix stats
+            buddyArray[mergeOrder].num_free_bytes -= oldBlock->size;
+            buddyArray[mergeOrder].num_free_bytes += (oldBlock->size / 2); 
+            // or any other final fix that code B does
+            return (char*)(oldBlock) + sizeof(MallocMetadata);
+        }
+    }
 
-    size_t bytesToCopy = (oldUserSize < newSize) ? oldUserSize : newSize;
+    // 3) fallback: allocate new, copy, free old
+    void* newp = smalloc(newSize);
+    if(!newp) return nullptr;
+    size_t bytesToCopy = (oldBlock->size < newSize) ? oldBlock->size : newSize;
     memmove(newp, oldp, bytesToCopy);
     sfree(oldp);
     return newp;
 }
 
-// ------------------------------------
-// Statistics (using sums of buddyStats & mmapStats)
-// ------------------------------------
+/**************************************************************
+ * Stats
+ **************************************************************/
 size_t _num_free_blocks()
 {
-    return sumFreeBlocks();
+    size_t total = 0;
+    for(int i=0; i<=MAX_ORDER; i++){
+        total += buddyArray[i].num_free_blocks;
+    }
+    total += mmapList.num_free_blocks;
+    return total;
 }
 
 size_t _num_free_bytes()
 {
-    return sumFreeBytes();
+    size_t total = 0;
+    for(int i=0; i<=MAX_ORDER; i++){
+        total += buddyArray[i].num_free_bytes;
+    }
+    total += mmapList.num_free_bytes;
+    return total;
 }
 
 size_t _num_allocated_blocks()
 {
-    return sumAllocatedBlocks();
+    size_t total = 0;
+    for(int i=0; i<=MAX_ORDER; i++){
+        total += buddyArray[i].num_allocated_blocks;
+    }
+    total += mmapList.num_allocated_blocks;
+    return total;
 }
 
 size_t _num_allocated_bytes()
 {
-    return sumAllocatedBytes();
+    size_t total = 0;
+    for(int i=0; i<=MAX_ORDER; i++){
+        total += buddyArray[i].num_allocated_bytes;
+    }
+    total += mmapList.num_allocated_bytes;
+    return total;
 }
 
 size_t _num_meta_data_bytes()
 {
-    return sumMetaDataBytes();
+    size_t total = 0;
+    for(int i=0; i<=MAX_ORDER; i++){
+        total += buddyArray[i].num_meta_data_bytes;
+    }
+    total += mmapList.num_meta_data_bytes;
+    return total;
 }
 
 size_t _size_meta_data()
 {
     return sizeof(MallocMetadata);
 }
-
